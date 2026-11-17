@@ -97,8 +97,17 @@ type Limiter struct {
 	// Empty means skip headers checking.
 	headers map[string]cache.Cache[string, bool]
 
+	// headersMu guards the headers map and serializes rule registration/removal.
+	// The caches it points to are thread-safe on their own; this lock exists to
+	// make the get-or-create of a rule and the additive merge into it atomic, so
+	// concurrent registrations can never publish a stale cache over a newer one.
+	headersMu sync.RWMutex
+
 	// Map of Context values to limit.
 	contextValues map[string]cache.Cache[string, bool]
+
+	// contextValuesMu guards the contextValues map, same rationale as headersMu.
+	contextValuesMu sync.RWMutex
 
 	// Map of limiters with TTL
 	tokenBuckets cache.Cache[string, *rate.Limiter]
@@ -396,10 +405,6 @@ func (l *Limiter) DeleteExpiredTokenBuckets() {
 
 // SetHeaders is thread-safe way of setting map of HTTP headers to limit.
 func (l *Limiter) SetHeaders(headers map[string][]string) *Limiter {
-	if l.headers == nil {
-		l.headers = make(map[string]cache.Cache[string, bool])
-	}
-
 	for header, entries := range headers {
 		l.SetHeader(header, entries)
 	}
@@ -411,8 +416,8 @@ func (l *Limiter) SetHeaders(headers map[string][]string) *Limiter {
 func (l *Limiter) GetHeaders() map[string][]string {
 	results := make(map[string][]string)
 
-	l.RLock()
-	defer l.RUnlock()
+	l.headersMu.RLock()
+	defer l.headersMu.RUnlock()
 
 	for header, entriesAsGoCache := range l.headers {
 		results[header] = entriesAsGoCache.Keys()
@@ -422,36 +427,45 @@ func (l *Limiter) GetHeaders() map[string][]string {
 }
 
 // SetHeader is thread-safe way of setting entries of 1 HTTP header.
+// Entries are merged into the existing rule, if any; entries that are already
+// registered are kept (idempotent add). The lookup-or-create of the rule and the
+// merge into it are performed under a single write lock, so concurrent calls for
+// the same header can never overwrite each other's entries.
 func (l *Limiter) SetHeader(header string, entries []string) *Limiter {
-	l.RLock()
-	existing, found := l.headers[header]
-	l.RUnlock()
-
 	ttl := l.GetHeaderEntryExpirationTTL()
 	if ttl <= 0 {
 		ttl = l.generalExpirableOptions.DefaultExpirationTTL
 	}
 
+	l.headersMu.Lock()
+	defer l.headersMu.Unlock()
+
+	if l.headers == nil {
+		l.headers = make(map[string]cache.Cache[string, bool])
+	}
+
+	existing, found := l.headers[header]
 	if !found {
 		existing = cache.NewCache[string, bool]().WithTTL(ttl)
+		l.headers[header] = existing
 	}
 
 	for _, entry := range entries {
 		existing.Set(entry, true, ttl)
 	}
 
-	l.Lock()
-	l.headers[header] = existing
-	l.Unlock()
-
 	return l
 }
 
 // GetHeader is thread-safe way of getting entries of 1 HTTP header.
 func (l *Limiter) GetHeader(header string) []string {
-	l.RLock()
-	entriesAsGoCache := l.headers[header]
-	l.RUnlock()
+	l.headersMu.RLock()
+	defer l.headersMu.RUnlock()
+
+	entriesAsGoCache, found := l.headers[header]
+	if !found {
+		return nil
+	}
 
 	return entriesAsGoCache.Keys()
 }
@@ -463,19 +477,24 @@ func (l *Limiter) RemoveHeader(header string) *Limiter {
 		ttl = l.generalExpirableOptions.DefaultExpirationTTL
 	}
 
-	l.Lock()
+	l.headersMu.Lock()
+	defer l.headersMu.Unlock()
+
+	if l.headers == nil {
+		l.headers = make(map[string]cache.Cache[string, bool])
+	}
+
 	l.headers[header] = cache.NewCache[string, bool]().WithTTL(ttl)
-	l.Unlock()
 
 	return l
 }
 
 // RemoveHeaderEntries is thread-safe way of removing new entries to 1 HTTP header rule.
 func (l *Limiter) RemoveHeaderEntries(header string, entriesForRemoval []string) *Limiter {
-	l.RLock()
-	entries, found := l.headers[header]
-	l.RUnlock()
+	l.headersMu.RLock()
+	defer l.headersMu.RUnlock()
 
+	entries, found := l.headers[header]
 	if !found {
 		return l
 	}
@@ -489,10 +508,6 @@ func (l *Limiter) RemoveHeaderEntries(header string, entriesForRemoval []string)
 
 // SetContextValues is thread-safe way of setting map of HTTP headers to limit.
 func (l *Limiter) SetContextValues(contextValues map[string][]string) *Limiter {
-	if l.contextValues == nil {
-		l.contextValues = make(map[string]cache.Cache[string, bool])
-	}
-
 	for contextValue, entries := range contextValues {
 		l.SetContextValue(contextValue, entries)
 	}
@@ -504,8 +519,8 @@ func (l *Limiter) SetContextValues(contextValues map[string][]string) *Limiter {
 func (l *Limiter) GetContextValues() map[string][]string {
 	results := make(map[string][]string)
 
-	l.RLock()
-	defer l.RUnlock()
+	l.contextValuesMu.RLock()
+	defer l.contextValuesMu.RUnlock()
 
 	for contextValue, entriesAsGoCache := range l.contextValues {
 		results[contextValue] = entriesAsGoCache.Keys()
@@ -515,36 +530,45 @@ func (l *Limiter) GetContextValues() map[string][]string {
 }
 
 // SetContextValue is thread-safe way of setting entries of 1 Context value.
+// Entries are merged into the existing rule, if any; entries that are already
+// registered are kept (idempotent add). The lookup-or-create of the rule and the
+// merge into it are performed under a single write lock, so concurrent calls for
+// the same context value can never overwrite each other's entries.
 func (l *Limiter) SetContextValue(contextValue string, entries []string) *Limiter {
-	l.RLock()
-	existing, found := l.contextValues[contextValue]
-	l.RUnlock()
-
 	ttl := l.GetContextValueEntryExpirationTTL()
 	if ttl <= 0 {
 		ttl = l.generalExpirableOptions.DefaultExpirationTTL
 	}
 
+	l.contextValuesMu.Lock()
+	defer l.contextValuesMu.Unlock()
+
+	if l.contextValues == nil {
+		l.contextValues = make(map[string]cache.Cache[string, bool])
+	}
+
+	existing, found := l.contextValues[contextValue]
 	if !found {
 		existing = cache.NewCache[string, bool]().WithTTL(ttl)
+		l.contextValues[contextValue] = existing
 	}
 
 	for _, entry := range entries {
 		existing.Set(entry, true, ttl)
 	}
 
-	l.Lock()
-	l.contextValues[contextValue] = existing
-	l.Unlock()
-
 	return l
 }
 
 // GetContextValue is thread-safe way of getting 1 Context value entry.
 func (l *Limiter) GetContextValue(contextValue string) []string {
-	l.RLock()
-	entriesAsGoCache := l.contextValues[contextValue]
-	l.RUnlock()
+	l.contextValuesMu.RLock()
+	defer l.contextValuesMu.RUnlock()
+
+	entriesAsGoCache, found := l.contextValues[contextValue]
+	if !found {
+		return nil
+	}
 
 	return entriesAsGoCache.Keys()
 }
@@ -556,19 +580,24 @@ func (l *Limiter) RemoveContextValue(contextValue string) *Limiter {
 		ttl = l.generalExpirableOptions.DefaultExpirationTTL
 	}
 
-	l.Lock()
+	l.contextValuesMu.Lock()
+	defer l.contextValuesMu.Unlock()
+
+	if l.contextValues == nil {
+		l.contextValues = make(map[string]cache.Cache[string, bool])
+	}
+
 	l.contextValues[contextValue] = cache.NewCache[string, bool]().WithTTL(ttl)
-	l.Unlock()
 
 	return l
 }
 
 // RemoveContextValuesEntries is thread-safe way of removing entries to a ContextValue.
 func (l *Limiter) RemoveContextValuesEntries(contextValue string, entriesForRemoval []string) *Limiter {
-	l.RLock()
-	entries, found := l.contextValues[contextValue]
-	l.RUnlock()
+	l.contextValuesMu.RLock()
+	defer l.contextValuesMu.RUnlock()
 
+	entries, found := l.contextValues[contextValue]
 	if !found {
 		return l
 	}
